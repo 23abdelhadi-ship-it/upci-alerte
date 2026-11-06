@@ -1,0 +1,5 @@
+# Ne jamais commiter : secrets, base locale, artefacts d'outils.
+.env
+data/
+.wrangler/
+node_modules/
