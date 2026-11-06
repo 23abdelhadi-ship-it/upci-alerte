@@ -125,7 +125,9 @@ export function hashCourt(str) {
 const b64 = (buf) => Buffer.from(new Uint8Array(buf)).toString('base64');
 const unb64 = (s) => new Uint8Array(Buffer.from(s, 'base64'));
 
-export async function hacherMotDePasse(motDePasse, iterations = 210000) {
+export async function hacherMotDePasse(motDePasse, iterations = 100000) {
+  // Plafond Cloudflare Workers : WebCrypto y refuse PBKDF2 au-delà de
+  // 100 000 itérations (Node l'accepte — écart vécu au 1er déploiement).
   const sel = crypto.getRandomValues(new Uint8Array(16));
   const cle = await deriver(motDePasse, sel, iterations);
   return `pbkdf2$sha256$${iterations}$${b64(sel)}$${b64(cle)}`;
