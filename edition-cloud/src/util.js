@@ -122,8 +122,26 @@ export function hashCourt(str) {
 // standard Web). Format stocké : pbkdf2$sha256$<itérations>$<sel>$<clé>
 // ---------------------------------------------------------------------
 
-const b64 = (buf) => Buffer.from(new Uint8Array(buf)).toString('base64');
-const unb64 = (s) => new Uint8Array(Buffer.from(s, 'base64'));
+// Base64 100 % Web standard (btoa/atob) : Buffer n'existe PAS sous
+// Cloudflare Workers — son usage ici a causé le 500 du 1er déploiement.
+const b64 = (buf) => {
+  const octets = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < octets.length; i++) s += String.fromCharCode(octets[i]);
+  return btoa(s);
+};
+const unb64 = (s) => {
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+};
+const b64VersUrl = (s) => s.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const b64DepuisUrl = (s) => {
+  let t = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (t.length % 4) t += '=';
+  return t;
+};
 
 export async function hacherMotDePasse(motDePasse, iterations = 100000) {
   // Plafond Cloudflare Workers : WebCrypto y refuse PBKDF2 au-delà de
@@ -161,7 +179,7 @@ export async function verifierMotDePasse(motDePasse, stocke) {
 // du mot de passe admin / de la clé de clôture.
 // ---------------------------------------------------------------------
 
-const b64url = (buf) => Buffer.from(new Uint8Array(buf)).toString('base64url');
+const b64url = (buf) => b64VersUrl(b64(buf));
 
 async function hmac(secret, message) {
   const cle = await crypto.subtle.importKey(
@@ -171,7 +189,7 @@ async function hmac(secret, message) {
 
 export async function signerSession(secret, donnees, dureeHeures = 12) {
   const charge = { ...donnees, exp: Date.now() + dureeHeures * 3600000 };
-  const corps = Buffer.from(JSON.stringify(charge)).toString('base64url');
+  const corps = b64url(new TextEncoder().encode(JSON.stringify(charge)));
   return `${corps}.${b64url(await hmac(secret, corps))}`;
 }
 
@@ -187,7 +205,7 @@ export async function verifierSession(secret, valeur) {
   for (let i = 0; i < sig.length; i++) diff |= sig.charCodeAt(i) ^ attendu.charCodeAt(i);
   if (diff !== 0) return null;
   try {
-    const charge = JSON.parse(Buffer.from(corps, 'base64url').toString('utf8'));
+    const charge = JSON.parse(new TextDecoder().decode(unb64(b64DepuisUrl(corps))));
     if (!charge.exp || charge.exp < Date.now()) return null;
     return charge;
   } catch {
