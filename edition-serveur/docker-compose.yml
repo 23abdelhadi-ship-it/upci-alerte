@@ -1,0 +1,36 @@
+# UPCI Alert — édition serveur : installation en UNE commande.
+#   docker compose up -d
+# Puis : http://<serveur>:8080  (formulaire)  et  /admin/  (administration)
+# Les secrets se règlent ici par variables d'environnement (prioritaires
+# sur config.php) — ne les écrivez jamais dans un fichier partagé.
+services:
+  web:
+    build: .
+    ports:
+      - "8080:80"
+    volumes:
+      - ./data:/var/www/html/data   # la base SQLite survit aux reconstructions
+    environment:
+      UPCI_TELEGRAM_TOKEN: "${UPCI_TELEGRAM_TOKEN:-}"
+      UPCI_TELEGRAM_SECRET: "${UPCI_TELEGRAM_SECRET:-}"
+      UPCI_TELEGRAM_CHATS: "${UPCI_TELEGRAM_CHATS:-}"
+      UPCI_CLOSURE_KEY: "${UPCI_CLOSURE_KEY:-}"
+      UPCI_ADMIN_HASH: "${UPCI_ADMIN_HASH:-}"
+    restart: unless-stopped
+
+  # Tâches planifiées (relances, escalades, regroupements, bilan mensuel…)
+  # Même image, boucle toutes les 30 minutes sur cli/cron.php.
+  cron:
+    build: .
+    command: sh -c "while true; do php /var/www/html/cli/cron.php; sleep 1800; done"
+    volumes:
+      - ./data:/var/www/html/data
+    environment:
+      UPCI_TELEGRAM_TOKEN: "${UPCI_TELEGRAM_TOKEN:-}"
+      UPCI_TELEGRAM_SECRET: "${UPCI_TELEGRAM_SECRET:-}"
+      UPCI_TELEGRAM_CHATS: "${UPCI_TELEGRAM_CHATS:-}"
+      UPCI_CLOSURE_KEY: "${UPCI_CLOSURE_KEY:-}"
+      UPCI_ADMIN_HASH: "${UPCI_ADMIN_HASH:-}"
+    depends_on:
+      - web
+    restart: unless-stopped
