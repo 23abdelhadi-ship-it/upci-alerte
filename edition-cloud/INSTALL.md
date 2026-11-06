@@ -140,16 +140,17 @@ valeurs — celles de la base priment ensuite.
    (p. ex. via `https://api.telegram.org/bot<jeton>/getUpdates`).
 3. Saisissez jeton + chat IDs dans `/installation` (ou `/admin/reglages`)
    et cliquez **« Envoyer un message Telegram test »**.
-4. Enregistrez le webhook (le bouton « ✅ Pris en charge » en dépend) :
+4. Le webhook (dont dépend le bouton « ✅ Pris en charge ») est
+   enregistré **automatiquement** par la page des réglages : à chaque
+   enregistrement, et à chaque « message Telegram test », le système
+   appelle `setWebhook` sur son adresse publique (`https://…/webhook`)
+   et affiche le résultat à l'écran. Rien à faire manuellement sur une
+   adresse publique (Cloudflare). En secours, l'appel manuel reste :
 
 ```bash
 curl "https://api.telegram.org/bot<jeton>/setWebhook" \
-  -d "url=https://<votre-adresse-publique>/webhook" \
-  -d "secret_token=<UPCI_TELEGRAM_SECRET si défini>"
+  -d "url=https://<votre-adresse-publique>/webhook"
 ```
-
-Sous Node, `node cli/init.mjs --webhook` fait la même chose si
-`UPCI_BASE_URL` et le jeton sont connus.
 
 ## 6. Note réseau — webhook et réseau local (voie B)
 
