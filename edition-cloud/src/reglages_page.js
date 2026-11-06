@@ -20,7 +20,7 @@
 import { h, emailValide, hacherMotDePasse } from './util.js';
 import { pageDebut, pageFin, reponseHtml, redirection } from './vue.js';
 import { enregistrerReglages, estConfigure, chargerReglages } from './settings.js';
-import { telegramSimple, envoyerMail } from './notify.js';
+import { telegramSimple, envoyerMail, tgApiJeton } from './notify.js';
 
 const MASQUE = '••••••••';
 
@@ -117,16 +117,37 @@ async function lireFormulaire(ctx, request) {
   return { fd, champ, tokenSaisi, cleSaisie, cfgTest };
 }
 
+/**
+ * Enregistre le webhook Telegram sur l'adresse publique du système
+ * (origine de la requête + /webhook). SANS cette étape — automatique
+ * ici — Telegram envoie les alertes mais ne transmet jamais les appuis
+ * sur le bouton « ✅ Pris en charge » ni les commandes /stats /critiques.
+ */
+async function activerWebhook(token, request) {
+  if (!token) return '';
+  const origine = new URL(request.url).origin;
+  if (!origine.startsWith('https://')) {
+    return ' ℹ️ Webhook Telegram non activé : adresse non publique (https requis) — le bouton « Pris en charge » s’activera sur l’adresse publique de production.';
+  }
+  const r = await tgApiJeton(token, 'setWebhook', {
+    url: `${origine}/webhook`,
+    allowed_updates: ['message', 'callback_query'],
+  });
+  return r
+    ? ' 🔗 Webhook Telegram activé : le bouton « ✅ Pris en charge » et les commandes /stats et /critiques répondent désormais.'
+    : ' ⚠️ Webhook Telegram : Telegram a refusé l’activation — vérifiez le jeton du bot.';
+}
+
 /** Exécute un des deux tests et retourne le message de résultat affiché à l'écran. */
-async function executerTest(ctx, action, cfgTest) {
+async function executerTest(ctx, action, cfgTest, request) {
   if (action === 'test_telegram') {
     if (!cfgTest.telegram_token) return '❌ Test Telegram impossible : aucun jeton de bot (ni saisi, ni enregistré).';
     if (!(cfgTest.telegram_chat_ids || []).length) return '❌ Test Telegram impossible : aucun identifiant de conversation (chat ID).';
     const n = await telegramSimple(cfgTest,
       '✅ <b>Message test UPCI</b>\nSi vous lisez ceci, le canal d’alerte Telegram de votre établissement fonctionne.');
-    return n > 0
-      ? `✅ Message Telegram test envoyé (${n} conversation(s)) — vérifiez votre Telegram.`
-      : '❌ Échec de l’envoi Telegram : vérifiez le jeton du bot et les chat IDs (le bot doit avoir reçu un premier message de chaque destinataire).';
+    if (n <= 0) return '❌ Échec de l’envoi Telegram : vérifiez le jeton du bot et les chat IDs (le bot doit avoir reçu un premier message de chaque destinataire).';
+    const note = await activerWebhook(cfgTest.telegram_token, request);
+    return `✅ Message Telegram test envoyé (${n} conversation(s)) — vérifiez votre Telegram.${note}`;
   }
   if (action === 'test_email') {
     const dest = (cfgTest.emails_alertes || [])[0];
@@ -151,7 +172,7 @@ async function traiterPost(ctx, request, mode) {
   const action = champ('action') || 'enregistrer';
 
   if (action === 'test_telegram' || action === 'test_email') {
-    const test = await executerTest(ctx, action, cfgTest);
+    const test = await executerTest(ctx, action, cfgTest, request);
     const v = { ...valeursAffichage(ctx),
       etablissement: champ('etablissement'), sites: champ('sites'),
       emails_alertes: champ('emails_alertes'), emails_bulletin: champ('emails_bulletin'),
@@ -210,6 +231,9 @@ async function traiterPost(ctx, request, mode) {
   await enregistrerReglages(ctx, valeurs);
   await ctx.journal('', installation ? 'Installation' : 'Admin (réglages)',
     'réglages', installation ? 'Première configuration enregistrée' : 'Réglages mis à jour');
+  // Le bouton Telegram « Pris en charge » exige le webhook : on
+  // l'enregistre automatiquement à chaque sauvegarde des réglages.
+  const noteWebhook = await activerWebhook(tokenSaisi || ctx.cfg.telegram_token, request);
 
   if (installation) {
     let s = pageDebut(ctx.cfg, 'Installation terminée');
@@ -218,6 +242,7 @@ async function traiterPost(ctx, request, mode) {
       + 'Cette page d’installation est désormais <strong>verrouillée définitivement</strong>.</p>'
       + '<p>Pour modifier les réglages plus tard : Administration → Réglages '
       + '(avec le mot de passe que vous venez de définir).</p>'
+      + (noteWebhook ? `<p>${h(noteWebhook.trim())}</p>` : '')
       + '<p><a class="btn" href="/admin/login">Aller à la connexion administration</a> '
       + '<a class="btn secondaire" href="/">Ouvrir le formulaire de signalement</a></p></div>';
     s += pageFin();
@@ -227,7 +252,7 @@ async function traiterPost(ctx, request, mode) {
   ctx.reglagesCharges = false;
   await chargerReglages(ctx);
   return reponseHtml(formulaire(ctx, mode, valeursAffichage(ctx),
-    { message: 'Réglages enregistrés — ils sont actifs immédiatement.' }));
+    { message: 'Réglages enregistrés — ils sont actifs immédiatement.' + noteWebhook }));
 }
 
 /** GET/POST /installation — verrouillée dès que le système est configuré. */
