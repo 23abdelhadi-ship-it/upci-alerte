@@ -1,1 +1,1 @@
-Date,Numéro,Type,Polyclinique,Service,Gravité,Délai demandé,Mesures,Statut,Intervention,Délai réel,Date clôture,Durée (h),Relance 1h,Escalade 4h
+Date,Numéro,Type,Polyclinique,Service,Gravité,Délai demandé,Mesures,Statut,Intervention,Délai réel,Date clôture,Durée (h),Relance 1h,Escalade 4h,Email déclarant,Action corrective,Vérification d'efficacité,Pris en charge le,Accusé par,Relance accusé,Msg Telegram,Relance vérification
