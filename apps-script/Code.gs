@@ -1,9 +1,37 @@
 /**
  * =====================================================================
- * SYSTÈME UPCI — EPSP DE SAÏDA  •  VERSION 4.0 (édition publiée améliorée)
+ * SYSTÈME UPCI — EPSP DE SAÏDA  •  VERSION 5.0 (édition publiée améliorée)
  * NOTE : l'EPSP de Saïda continue d'exploiter la V3.0 en production.
- * La V4.0 est l'édition améliorée publiée sur GitHub (dépôt upci-alert-system),
+ * La V5.0 est l'édition améliorée publiée sur GitHub (dépôt upci-alert-system),
  * destinée aux nouvelles installations et à la généralisation.
+ * Nouveautés V5.0 (par rapport à V4.0) :
+ *  1. BOUCLE D'APPRENTISSAGE des cas critiques : la clôture d'un cas
+ *     critique (gravité ≥ seuil) saisit l'« Action corrective » puis la
+ *     « Vérification d'efficacité » (colonnes ajoutées EN FIN de registre) ;
+ *     le contrôle périodique relance tant que la vérification est en attente.
+ *  2. JOURNAL D'AUDIT : feuille « Journal » en ajout seul (append-only) —
+ *     chaque changement d'état y est consigné (création, accusé, relance,
+ *     escalade, clôture, réouverture…) avec horodatage, numéro et acteur.
+ *  3. MODE DÉMO : genererDonneesDemo() crée des signalements marqués
+ *     « DÉMO » (aucune notification réelle, exclus des indicateurs) ;
+ *     supprimerDonneesDemo() supprime exactement ces lignes.
+ *  4. RÈGLE DE REGROUPEMENT : ≥ SEUIL_GROUPE signalements de même type
+ *     et même polyclinique en 7 jours → alerte « Regroupement suspecté »
+ *     (au plus une par regroupement et par semaine).
+ *  5. BILAN CLIN en PDF : le rapport mensuel est aussi produit en PDF
+ *     (DocumentApp → PDF), joint à l'email et archivé dans Drive.
+ *  6. ACCUSÉ TELEGRAM (P1) : le message d'alerte porte un bouton
+ *     « ✅ Pris en charge » ; le doPost traite le callback_query, remplit
+ *     « Pris en charge le » / « Accusé par », met à jour le message, et
+ *     l'escalade des critiques tient compte de l'absence d'accusé.
+ *  7. MONITEUR DE SILENCE (P8) : contrôle hebdomadaire — un site sans
+ *     aucun signalement depuis SILENCE_SEMAINES semaines est signalé
+ *     à l'administrateur (le silence est une donnée, pas un succès).
+ *  8. BULLETIN MENSUEL (P7) : « Vous avez signalé → nous avons changé »,
+ *     construit des clôtures du mois écoulé, envoyé à EMAILS_BULLETIN.
+ *  9. BATTEMENT DE CŒUR (P14) : contrôle de santé hebdomadaire
+ *     (déclencheurs, dernier signalement, registre, sauvegarde récente)
+ *     — une ligne OK/alerte à l'administrateur, consignée au Journal.
  * Nouveautés V4.0 (par rapport à V3.0) :
  *  A. Notification du DÉCLARANT à la clôture : son email est conservé au
  *     registre (colonne « Email déclarant », usage interne) et il reçoit
@@ -62,13 +90,34 @@ const CONFIG = {
   SLA_ESCALADE_HEURES: 4,       // escalade si critique ouvert > 4 h
   NOTIFIER_DECLARANT: true,     // V4 : email au déclarant à la clôture
   DOSSIER_SAUVEGARDE: "Sauvegardes UPCI", // V4 : dossier Drive des CSV hebdomadaires
+  // --- V5 ---
+  JOURNAL_ACTIF: true,          // V5 : feuille « Journal » (audit, ajout seul)
+  ACCUSE_TELEGRAM: true,        // V5 : bouton « ✅ Pris en charge » sur l'alerte Telegram
+  REGROUPEMENT_ACTIF: true,     // V5 : règle de regroupement (cluster)
+  SEUIL_GROUPE: 3,              // V5 : nb de signalements même type + même site…
+  FENETRE_GROUPE_JOURS: 7,      // V5 : …dans cette fenêtre (jours) → alerte groupée
+  VERIF_EFFICACITE_JOURS: 7,    // V5 : rappel « vérification d'efficacité » N jours après la clôture d'un critique
+  SILENCE_ACTIF: true,          // V5 : moniteur de silence des sites
+  SILENCE_SEMAINES: 3,          // V5 : semaines sans signalement = site silencieux
+  BULLETIN_ACTIF: true,         // V5 : bulletin « Vous avez signalé → nous avons changé »
+  RAPPORT_PDF: true,            // V5 : bilan CLIN mensuel aussi en PDF
+  DOSSIER_RAPPORTS: "Rapports UPCI", // V5 : dossier Drive des PDF de bilans
+  SANTE_ACTIF: true,            // V5 : battement de cœur hebdomadaire
   TZ: "Africa/Algiers"
 };
 
-// V4 — Surcharge optionnelle par la feuille « Configuration » du classeur
+// V4/V5 — Surcharge optionnelle par la feuille « Configuration » du classeur
 // registre (colonnes : Clé | Valeur). Clés reconnues : SEUIL_CRITIQUE,
-// SLA_CRITIQUE_HEURES, SLA_ESCALADE_HEURES, EMAILS (séparés par des virgules).
+// SLA_CRITIQUE_HEURES, SLA_ESCALADE_HEURES, EMAILS (séparés par des virgules) ;
+// V5 : SEUIL_GROUPE, SILENCE_SEMAINES, EMAILS_BULLETIN, SITES, SITES_EXEMPTS,
+// et interrupteurs OUI/NON : JOURNAL_ACTIF, ACCUSE_TELEGRAM, REGROUPEMENT_ACTIF,
+// SILENCE_ACTIF, BULLETIN_ACTIF, RAPPORT_PDF, SANTE_ACTIF.
 let EMAILS_SURCHARGE_ = null;
+let EMAILS_BULLETIN_ = null;
+let SITES_ = null;
+let SITES_EXEMPTS_ = null;
+const CLES_BOOLEENNES_ = ["JOURNAL_ACTIF", "ACCUSE_TELEGRAM", "REGROUPEMENT_ACTIF",
+  "SILENCE_ACTIF", "BULLETIN_ACTIF", "RAPPORT_PDF", "SANTE_ACTIF"];
 function appliquerConfigFeuille_() {
   try {
     const ss = classeurRegistre_(); if (!ss) return;
@@ -82,6 +131,14 @@ function appliquerConfigFeuille_() {
       if (cle === "SLA_CRITIQUE_HEURES" && parseFloat(v)) CONFIG.SLA_CRITIQUE_HEURES = parseFloat(v);
       if (cle === "SLA_ESCALADE_HEURES" && parseFloat(v)) CONFIG.SLA_ESCALADE_HEURES = parseFloat(v);
       if (cle === "EMAILS") EMAILS_SURCHARGE_ = v.split(",").map(s => s.trim()).filter(String);
+      // V5
+      if (cle === "SEUIL_GROUPE" && parseInt(v, 10)) CONFIG.SEUIL_GROUPE = parseInt(v, 10);
+      if (cle === "SILENCE_SEMAINES" && parseInt(v, 10)) CONFIG.SILENCE_SEMAINES = parseInt(v, 10);
+      if (cle === "EMAILS_BULLETIN") EMAILS_BULLETIN_ = v.split(",").map(s => s.trim()).filter(String);
+      if (cle === "SITES") SITES_ = v.split(",").map(s => s.trim()).filter(String);
+      if (cle === "SITES_EXEMPTS") SITES_EXEMPTS_ = v.split(",").map(s => s.trim()).filter(String);
+      if (CLES_BOOLEENNES_.indexOf(cle) > -1)
+        CONFIG[cle] = ["OUI", "TRUE", "1", "VRAI", "YES"].indexOf(v.toUpperCase()) > -1;
     }
   } catch (e) { console.log("⚠️ Configuration feuille : " + e.message); }
 }
@@ -101,6 +158,11 @@ function emails_() {
   if (EMAILS_SURCHARGE_ && EMAILS_SURCHARGE_.length) return EMAILS_SURCHARGE_;
   const v = prop_("EMAILS", "");
   return v ? v.split(",").map(s => s.trim()).filter(String) : CONFIG.EMAILS;
+}
+// V5 : destinataires du bulletin mensuel (clé EMAILS_BULLETIN de la feuille
+// « Configuration ») ; repli sur les destinataires d'alerte.
+function emailsBulletin_() {
+  return (EMAILS_BULLETIN_ && EMAILS_BULLETIN_.length) ? EMAILS_BULLETIN_ : emails_();
 }
 
 // Identifiants des ressources : lus depuis les Script Properties
@@ -132,7 +194,8 @@ function configurer() {
 // 1. INSTALLATION / MAINTENANCE DES DÉCLENCHEURS
 // ---------------------------------------------------------------------
 function installerTriggers() {
-  const handlers = ["onFormSubmit", "verifierCritiquesEnAttente", "rapportMensuel", "sauvegardeHebdomadaire"];
+  const handlers = ["onFormSubmit", "verifierCritiquesEnAttente", "rapportMensuel", "sauvegardeHebdomadaire",
+    "controleSilenceSites", "bulletinMensuel", "controleSanteHebdomadaire"];
   ScriptApp.getProjectTriggers().forEach(t => {
     if (handlers.indexOf(t.getHandlerFunction()) > -1) ScriptApp.deleteTrigger(t);
   });
@@ -149,7 +212,13 @@ function installerTriggers() {
     ScriptApp.newTrigger("rapportMensuel").timeBased().onMonthDay(1).atHour(8).create();
     // V4 : sauvegarde hebdomadaire du registre (dimanche 7 h)
     ScriptApp.newTrigger("sauvegardeHebdomadaire").timeBased().onWeekDay(ScriptApp.WeekDay.SUNDAY).atHour(7).create();
-    console.log("✅ Déclencheurs installés : formulaires + escalade (30 min) + rapport mensuel + sauvegarde hebdomadaire.");
+    // V5 : battement de cœur hebdomadaire (dimanche 8 h, après la sauvegarde)
+    ScriptApp.newTrigger("controleSanteHebdomadaire").timeBased().onWeekDay(ScriptApp.WeekDay.SUNDAY).atHour(8).create();
+    // V5 : moniteur de silence des sites (lundi 8 h)
+    ScriptApp.newTrigger("controleSilenceSites").timeBased().onWeekDay(ScriptApp.WeekDay.MONDAY).atHour(8).create();
+    // V5 : bulletin « Vous avez signalé → nous avons changé » (le 1er du mois à 9 h, après le bilan CLIN)
+    ScriptApp.newTrigger("bulletinMensuel").timeBased().onMonthDay(1).atHour(9).create();
+    console.log("✅ Déclencheurs installés : formulaires + escalade (30 min) + rapport mensuel + sauvegarde hebdomadaire + santé (dim. 8 h) + silence (lun. 8 h) + bulletin mensuel.");
     afficherLiens();
   } catch (e) {
     console.log("❌ Échec de l'installation : " + e.message);
@@ -174,7 +243,14 @@ function afficherLiens() {
 // ---------------------------------------------------------------------
 const ENTETES_SUIVI = ["Date", "Numéro", "Type", "Polyclinique", "Service", "Gravité",
   "Délai demandé", "Mesures", "Statut", "Intervention", "Délai réel",
-  "Date clôture", "Durée (h)", "Relance 1h", "Escalade 4h", "Email déclarant"];
+  "Date clôture", "Durée (h)", "Relance 1h", "Escalade 4h", "Email déclarant",
+  // V5 — colonnes ajoutées STRICTEMENT À LA FIN : la migration de feuilleSuivi_()
+  // les écrit aux positions suivantes sans déplacer aucune colonne existante.
+  "Action corrective", "Vérification d'efficacité", "Pris en charge le",
+  "Accusé par", "Relance accusé", "Msg Telegram", "Relance vérification"];
+
+/** V5 : un signalement est « démo » si son numéro porte le préfixe DÉMO. */
+function estDemo_(numero) { return String(numero || "").indexOf("DÉMO") === 0; }
 
 function classeurRegistre_() {
   if (registreId_()) return SpreadsheetApp.openById(registreId_());
@@ -319,12 +395,24 @@ function traiterSignalement(nv, response) {
   let emailDecl = "";
   try { emailDecl = response.getRespondentEmail() || ""; } catch (err) { emailDecl = ""; }
 
-  envoyerNotifications(sujet, corps);
+  // Emails : inchangés. Telegram : V5 envoie l'alerte AVEC le bouton
+  // « ✅ Pris en charge » et conserve les références des messages envoyés
+  // (chat_id:message_id) pour pouvoir les mettre à jour lors de l'accusé.
+  emails_().forEach(email => envoyerMail(email, sujet, corps));
+  let msgTelegram = "";
+  if (CONFIG.ACCUSE_TELEGRAM) {
+    msgTelegram = envoyerTelegramAlerte_(sujet, corps, numero);
+    if (!msgTelegram) envoyerTelegram("<b>" + echapperHtml_(sujet) + "</b>\n\n" + echapperHtml_(corps) + lienRegistre_());
+  } else {
+    envoyerTelegram("<b>" + echapperHtml_(sujet) + "</b>\n\n" + echapperHtml_(corps) + lienRegistre_());
+  }
   enregistrerSignalement_({
     numero: numero, poly: poly, service: service, gravite: gravite,
-    delai: delai, mesures: mesures, emailDecl: emailDecl,
+    delai: delai, mesures: mesures, emailDecl: emailDecl, msgTelegram: msgTelegram,
     statut: critique ? "CRITIQUE - En attente" : "En attente"
   });
+  journaliser_(numero, emailDecl || "Déclarant (formulaire)", "création",
+    poly + " — " + service + " — gravité " + gravite);
 
   if (emailDecl) {
     const urlSuivi = prop_("WEBAPP_URL", "");
@@ -351,6 +439,7 @@ function enregistrerSignalement_(d) {
   ligne[colIndex_(sheet, "Mesures") - 1] = d.mesures;
   ligne[colIndex_(sheet, "Statut") - 1] = d.statut;
   ligne[colIndex_(sheet, "Email déclarant") - 1] = d.emailDecl || "";
+  ligne[colIndex_(sheet, "Msg Telegram") - 1] = d.msgTelegram || "";
   sheet.appendRow(ligne.map(v => v === undefined ? "" : v));
 }
 
@@ -362,44 +451,73 @@ function traiterCloture(nv) {
   const intervention = champ_(nv, ["intervention réalisée", "intervention realisee"]);
   const statutForm   = champ_(nv, ["statut de clôture", "statut"]);
   const delaiReelTxt = champ_(nv, ["délai réel", "delai reel"]);
+  // V5 — boucle d'apprentissage (cas critiques) : champs optionnels du
+  // formulaire de clôture ; absents des anciens formulaires → ignorés.
+  const actionCorrective = champ_(nv, ["action corrective"]);
+  const verifEfficacite  = champ_(nv, ["vérification d'efficacité", "verification d'efficacite", "efficacité"]);
 
   const sheet = feuilleSuivi_();
   let trouve = false, dureeH = "", emailDeclLigne = "", polyLigne = "";
+  let dejaFerme = false, verifSeule = false, estCritiqueLigne = false;
   if (sheet && numero && numero !== "-") {
     const cNum = colIndex_(sheet, "Numéro");
     const donnees = sheet.getDataRange().getValues();
     for (let i = 1; i < donnees.length; i++) {
       if (String(donnees[i][cNum - 1]).trim() === numero) {
-        const dateSignal = new Date(donnees[i][colIndex_(sheet, "Date") - 1]);
-        const maintenant = new Date();
-        dureeH = Math.round(((maintenant - dateSignal) / 3600000) * 10) / 10;
-        sheet.getRange(i + 1, colIndex_(sheet, "Statut")).setValue(statutForm && statutForm !== "-" ? statutForm : "Clôturé");
-        sheet.getRange(i + 1, colIndex_(sheet, "Intervention")).setValue(intervention);
-        sheet.getRange(i + 1, colIndex_(sheet, "Délai réel")).setValue(delaiReelTxt);
-        sheet.getRange(i + 1, colIndex_(sheet, "Date clôture")).setValue(maintenant);
-        sheet.getRange(i + 1, colIndex_(sheet, "Durée (h)")).setValue(dureeH);
+        trouve = true;
+        dejaFerme = !!donnees[i][colIndex_(sheet, "Date clôture") - 1];
+        estCritiqueLigne = (parseInt(donnees[i][colIndex_(sheet, "Gravité") - 1], 10) || 0) >= CONFIG.SEUIL_CRITIQUE;
         emailDeclLigne = String(donnees[i][colIndex_(sheet, "Email déclarant") - 1] || "");
         polyLigne = String(donnees[i][colIndex_(sheet, "Polyclinique") - 1] || "");
-        trouve = true;
+        // V5 : resoumission sur un dossier DÉJÀ clôturé portant seulement la
+        // vérification d'efficacité → on ne touche ni au statut, ni à
+        // l'intervention, ni à la date/durée de clôture d'origine.
+        verifSeule = dejaFerme && verifEfficacite && verifEfficacite !== "-";
+        if (verifSeule) {
+          sheet.getRange(i + 1, colIndex_(sheet, "Vérification d'efficacité")).setValue(verifEfficacite);
+          if (actionCorrective && actionCorrective !== "-")
+            sheet.getRange(i + 1, colIndex_(sheet, "Action corrective")).setValue(actionCorrective);
+          journaliser_(numero, "Formulaire clôture", "vérification", verifEfficacite);
+        } else {
+          const dateSignal = new Date(donnees[i][colIndex_(sheet, "Date") - 1]);
+          const maintenant = new Date();
+          dureeH = Math.round(((maintenant - dateSignal) / 3600000) * 10) / 10;
+          sheet.getRange(i + 1, colIndex_(sheet, "Statut")).setValue(statutForm && statutForm !== "-" ? statutForm : "Clôturé");
+          sheet.getRange(i + 1, colIndex_(sheet, "Intervention")).setValue(intervention);
+          sheet.getRange(i + 1, colIndex_(sheet, "Délai réel")).setValue(delaiReelTxt);
+          sheet.getRange(i + 1, colIndex_(sheet, "Date clôture")).setValue(maintenant);
+          sheet.getRange(i + 1, colIndex_(sheet, "Durée (h)")).setValue(dureeH);
+          if (actionCorrective && actionCorrective !== "-")
+            sheet.getRange(i + 1, colIndex_(sheet, "Action corrective")).setValue(actionCorrective);
+          if (verifEfficacite && verifEfficacite !== "-")
+            sheet.getRange(i + 1, colIndex_(sheet, "Vérification d'efficacité")).setValue(verifEfficacite);
+          journaliser_(numero, "Formulaire clôture", "clôture",
+            (statutForm || "Clôturé") + " — " + intervention);
+        }
         break;
       }
     }
   }
 
-  const sujet = "✅ Clôture — " + numero;
+  const sujet = verifSeule ? ("🔍 Vérification d'efficacité — " + numero) : ("✅ Clôture — " + numero);
   const corps = [
-    "Clôture enregistrée pour : " + numero,
-    "Intervention : " + intervention,
+    verifSeule ? ("Vérification d'efficacité enregistrée pour : " + numero)
+               : ("Clôture enregistrée pour : " + numero),
+    verifSeule ? ("Résultat : " + verifEfficacite) : ("Intervention : " + intervention),
     "Statut : " + (statutForm || "Clôturé"),
     "Délai réel : " + delaiReelTxt,
     dureeH !== "" ? ("Durée totale : " + dureeH + " h") : "",
+    (actionCorrective && actionCorrective !== "-") ? ("Action corrective : " + actionCorrective) : "",
+    (trouve && !verifSeule && estCritiqueLigne && (!actionCorrective || actionCorrective === "-"))
+      ? "⚠️ Cas critique : pensez à renseigner l'action corrective, puis la vérification d'efficacité (formulaire de clôture)." : "",
     trouve ? "Registre mis à jour ✔" : "⚠️ Numéro introuvable au registre — vérification manuelle requise."
   ].filter(String).join("\n");
   envoyerNotifications(sujet, corps);
   if (!trouve) alerterAdmin_("Clôture orpheline", new Error("Numéro introuvable : " + numero));
 
   // V4 : notification de traitement au déclarant (boucle de retour fermée)
-  if (trouve && CONFIG.NOTIFIER_DECLARANT && emailDeclLigne) {
+  // V5 : uniquement à la première clôture (pas lors d'une vérification seule).
+  if (trouve && !verifSeule && CONFIG.NOTIFIER_DECLARANT && emailDeclLigne) {
     envoyerMail(emailDeclLigne, "Signalement traité et clôturé — " + numero, [
       "Votre signalement " + numero + (polyLigne ? " (" + polyLigne + ")" : "") + " a été traité et clôturé.",
       "Intervention : " + intervention,
@@ -419,25 +537,105 @@ function verifierCritiquesEnAttente() {
   const c = nom => colIndex_(sheet, nom);
   const maintenant = new Date();
   for (let i = 1; i < donnees.length; i++) {
+    const numero = String(donnees[i][c("Numéro") - 1] || "");
+    if (!numero || estDemo_(numero)) continue; // V5 : les démos ne déclenchent aucune alerte réelle
     const statut = String(donnees[i][c("Statut") - 1] || "");
     const gravite = parseInt(donnees[i][c("Gravité") - 1], 10) || 0;
     const estCritique = gravite >= CONFIG.SEUIL_CRITIQUE || statut.indexOf("CRITIQUE") > -1;
     const estOuvert = !donnees[i][c("Date clôture") - 1] && statut.indexOf("Clôtur") === -1;
     if (!estCritique || !estOuvert) continue;
     const ageH = (maintenant - new Date(donnees[i][c("Date") - 1])) / 3600000;
-    const numero = String(donnees[i][c("Numéro") - 1]);
+    // V5 (P1) : relance « non pris en charge » — un critique ouvert dont
+    // PERSONNE n'a accusé réception après le délai SLA est relancé une fois,
+    // indépendamment des relances de clôture ci-dessous (conservées).
+    const accuse = !!donnees[i][c("Pris en charge le") - 1];
+    if (CONFIG.ACCUSE_TELEGRAM && !accuse && ageH >= CONFIG.SLA_CRITIQUE_HEURES && !donnees[i][c("Relance accusé") - 1]) {
+      envoyerNotifications("⚠️ NON PRIS EN CHARGE — critique sans accusé depuis " + Math.round(ageH) + " h — " + numero,
+        "Le signalement critique " + numero + " (" + donnees[i][c("Polyclinique") - 1] + " — " +
+        donnees[i][c("Service") - 1] + ") n'a reçu AUCUN accusé de prise en charge après " + Math.round(ageH) +
+        " heures.\nOuvrez l'alerte Telegram et appuyez sur « ✅ Pris en charge », ou intervenez et clôturez.");
+      sheet.getRange(i + 1, c("Relance accusé")).setValue(new Date());
+      journaliser_(numero, "Système (SLA)", "relance", "Aucun accusé de prise en charge après " + Math.round(ageH) + " h");
+    }
     if (ageH >= CONFIG.SLA_ESCALADE_HEURES && !donnees[i][c("Escalade 4h") - 1]) {
       envoyerNotifications("⏰⏰ ESCALADE — critique non clôturé depuis " + Math.round(ageH) + " h — " + numero,
         "Le signalement critique " + numero + " (" + donnees[i][c("Polyclinique") - 1] + " — " +
         donnees[i][c("Service") - 1] + ") attend toujours une clôture après " + Math.round(ageH) + " heures.\nÉvaluation et consignation au registre requises.");
       sheet.getRange(i + 1, c("Escalade 4h")).setValue(new Date());
+      journaliser_(numero, "Système (SLA)", "escalade", "Critique non clôturé après " + Math.round(ageH) + " h");
     } else if (ageH >= CONFIG.SLA_CRITIQUE_HEURES && !donnees[i][c("Relance 1h") - 1]) {
       envoyerNotifications("⏰ RAPPEL SLA — critique en attente > 1 h — " + numero,
         "Le signalement critique " + numero + " (" + donnees[i][c("Polyclinique") - 1] + " — " +
         donnees[i][c("Service") - 1] + ") n'est pas encore clôturé après plus d'une heure (protocole : évaluation < 1 h).");
       sheet.getRange(i + 1, c("Relance 1h")).setValue(new Date());
+      journaliser_(numero, "Système (SLA)", "relance", "Critique non clôturé après plus d'une heure");
     }
   }
+  // V5 : vérifications d'efficacité en attente + règle de regroupement
+  verifierVerificationsEnAttente_(sheet, donnees, c, maintenant);
+  verifierRegroupements_(sheet, donnees, c, maintenant);
+}
+
+/**
+ * V5 — Boucle d'apprentissage : tout critique CLÔTURÉ depuis au moins
+ * VERIF_EFFICACITE_JOURS jours sans « Vérification d'efficacité » reçoit
+ * UN rappel (drapeau « Relance vérification »), jusqu'à sa saisie via le
+ * formulaire de clôture.
+ */
+function verifierVerificationsEnAttente_(sheet, donnees, c, maintenant) {
+  for (let i = 1; i < donnees.length; i++) {
+    const numero = String(donnees[i][c("Numéro") - 1] || "");
+    if (!numero || estDemo_(numero)) continue;
+    const dClot = donnees[i][c("Date clôture") - 1];
+    if (!dClot) continue;
+    const gravite = parseInt(donnees[i][c("Gravité") - 1], 10) || 0;
+    if (gravite < CONFIG.SEUIL_CRITIQUE) continue;
+    if (String(donnees[i][c("Vérification d'efficacité") - 1] || "").trim()) continue;
+    if (donnees[i][c("Relance vérification") - 1]) continue;
+    const ageJ = (maintenant - new Date(dClot)) / 86400000;
+    if (ageJ < CONFIG.VERIF_EFFICACITE_JOURS) continue;
+    envoyerNotifications("🔍 VÉRIFICATION D'EFFICACITÉ EN ATTENTE — " + numero,
+      "Le cas critique " + numero + " (" + donnees[i][c("Polyclinique") - 1] + " — " +
+      donnees[i][c("Service") - 1] + ") a été clôturé il y a " + Math.floor(ageJ) + " jours.\n" +
+      "Action corrective consignée : " + (String(donnees[i][c("Action corrective") - 1] || "—")) + "\n" +
+      "Vérifiez sur place si le problème a réellement disparu, puis consignez le résultat via le formulaire de clôture (champ « Vérification d'efficacité »).");
+    sheet.getRange(i + 1, c("Relance vérification")).setValue(new Date());
+    journaliser_(numero, "Système", "relance", "Vérification d'efficacité en attente depuis " + Math.floor(ageJ) + " j");
+  }
+}
+
+/**
+ * V5 — Règle de regroupement (cluster) : ≥ SEUIL_GROUPE signalements de
+ * même Type ET même Polyclinique dans les FENETRE_GROUPE_JOURS derniers
+ * jours → UNE alerte « Regroupement suspecté » (déduplication : au plus
+ * une par regroupement et par semaine calendaire, via Script Properties).
+ */
+function verifierRegroupements_(sheet, donnees, c, maintenant) {
+  if (!CONFIG.REGROUPEMENT_ACTIF) return;
+  const limite = new Date(maintenant.getTime() - CONFIG.FENETRE_GROUPE_JOURS * 86400000);
+  const groupes = {};
+  for (let i = 1; i < donnees.length; i++) {
+    const numero = String(donnees[i][c("Numéro") - 1] || "");
+    if (!numero || estDemo_(numero)) continue;
+    const d = new Date(donnees[i][c("Date") - 1]);
+    if (isNaN(d) || d < limite) continue;
+    const cle = String(donnees[i][c("Type") - 1] || "Signalement") + " | " + String(donnees[i][c("Polyclinique") - 1] || "—");
+    (groupes[cle] = groupes[cle] || []).push(numero);
+  }
+  const semaine = Utilities.formatDate(maintenant, CONFIG.TZ, "yyyy-'S'ww");
+  Object.keys(groupes).forEach(cle => {
+    const numeros = groupes[cle];
+    if (numeros.length < CONFIG.SEUIL_GROUPE) return;
+    const cleProp = "GROUPE_" + cle.replace(/[^\wÀ-ÿ]+/g, "_");
+    if (PROPS.getProperty(cleProp) === semaine) return; // déjà alerté cette semaine
+    PROPS.setProperty(cleProp, semaine);
+    envoyerNotifications("🧩 REGROUPEMENT SUSPECTÉ — " + cle,
+      numeros.length + " signalements du même type à la même polyclinique en " +
+      CONFIG.FENETRE_GROUPE_JOURS + " jours : " + numeros.join(", ") + ".\n" +
+      "Piste : cause commune ou début de cluster — examen en réunion CLIN et vigilance renforcée recommandés.");
+    journaliser_(numeros[0], "Système", "regroupement", cle + " — " + numeros.length + " signalements en " +
+      CONFIG.FENETRE_GROUPE_JOURS + " j : " + numeros.join(", "));
+  });
 }
 
 // ---------------------------------------------------------------------
@@ -455,6 +653,7 @@ function rapportMensuel() {
   for (let i = 1; i < donnees.length; i++) {
     const d = new Date(donnees[i][c("Date") - 1]);
     if (d.getMonth() !== mois || d.getFullYear() !== annee) continue;
+    if (estDemo_(String(donnees[i][c("Numéro") - 1] || ""))) continue; // V5 : démos hors bilan officiel
     total++;
     const g = parseInt(donnees[i][c("Gravité") - 1], 10) || 0;
     if (g >= CONFIG.SEUIL_CRITIQUE) critiques++;
@@ -477,7 +676,17 @@ function rapportMensuel() {
   Object.keys(parPoly).sort().forEach(p => lignes.push("• " + p + " : " + parPoly[p]));
   lignes.push("", "Document de base pour le bilan épidémiologique présenté au CLIN.");
   const corps = lignes.join("\n");
-  emails_().forEach(em => envoyerMail(em, "📊 Bilan mensuel PCI — " + (mois + 1) + "/" + annee, corps));
+  // V5 : le bilan est aussi produit en PDF (archivé dans Drive et joint à
+  // l'email). En cas d'échec PDF, l'email texte part seul (comportement V4).
+  let pdfBilan = null;
+  if (CONFIG.RAPPORT_PDF) {
+    try { pdfBilan = genererPdfBilan_(lignes); }
+    catch (e) { console.log("⚠️ PDF du bilan : " + e.message); }
+  }
+  emails_().forEach(em => {
+    if (pdfBilan) envoyerMailAvecPdf_(em, "📊 Bilan mensuel PCI — " + (mois + 1) + "/" + annee, corps, pdfBilan);
+    else envoyerMail(em, "📊 Bilan mensuel PCI — " + (mois + 1) + "/" + annee, corps);
+  });
   envoyerTelegram("📊 Bilan mensuel PCI (" + (mois + 1) + "/" + annee + ")\nSignalements : " + total +
     " • Critiques : " + critiques + " • Clôturés : " + clotures);
   console.log(corps);
@@ -549,7 +758,9 @@ function installerWebhook() {
 function doPost(e) {
   try {
     const upd = JSON.parse(e.postData.contents);
-    const msg = upd.message || (upd.callback_query && upd.callback_query.message);
+    // V5 (P1) : appui sur un bouton inline (« ✅ Pris en charge »)
+    if (upd.callback_query) { traiterAccuseTelegram_(upd.callback_query); return; }
+    const msg = upd.message;
     if (!msg || !msg.text) return;
     const chatId = String(msg.chat.id);
     if (telegramChats_().indexOf(chatId) === -1) return; // chats autorisés uniquement
@@ -559,6 +770,111 @@ function doPost(e) {
     else if (texte === "/aide" || texte === "/start") repondreBot_(chatId,
       "Bot UPCI — EPSP Saïda\n/stats : synthèse du registre\n/critiques : signalements critiques encore ouverts");
   } catch (err) { console.log("❌ doPost : " + err.message); }
+}
+
+/** Appel générique à l'API Telegram ; renvoie l'objet JSON ou null. */
+function telegramApi_(methode, payload) {
+  const token = telegramToken_(); if (!token) return null;
+  try {
+    const res = UrlFetchApp.fetch("https://api.telegram.org/bot" + token + "/" + methode, {
+      method: "post", payload: payload, muteHttpExceptions: true
+    });
+    return JSON.parse(res.getContentText());
+  } catch (e) { console.log("❌ telegramApi " + methode + " : " + e.message); return null; }
+}
+
+/**
+ * V5 (P1) — Envoie l'alerte Telegram AVEC le bouton inline
+ * « ✅ Pris en charge » (callback_data « ack:<numéro> ») et renvoie les
+ * références des messages créés, au format « chatId:messageId;… »,
+ * à conserver au registre (colonne « Msg Telegram »).
+ */
+function envoyerTelegramAlerte_(sujet, corps, numero) {
+  const token = telegramToken_();
+  if (!token) { console.log("⚠️ TELEGRAM_TOKEN absent des Script Properties — exécutez configurer()."); return ""; }
+  const texte = "<b>" + echapperHtml_(sujet) + "</b>\n\n" + echapperHtml_(corps) + lienRegistre_();
+  const refs = [];
+  telegramChats_().forEach(chatId => {
+    const r = telegramApi_("sendMessage", {
+      chat_id: chatId, text: texte, parse_mode: "HTML", disable_web_page_preview: "true",
+      reply_markup: JSON.stringify({ inline_keyboard: [[{ text: "✅ Pris en charge", callback_data: "ack:" + numero }]] })
+    });
+    if (r && r.ok && r.result) { refs.push(chatId + ":" + r.result.message_id); console.log("✅ Telegram (bouton) → " + chatId); }
+    else console.log("❌ Telegram (bouton) → " + chatId + " : " + (r ? r.description : "pas de réponse"));
+  });
+  return refs.join(";");
+}
+
+function repondreCallback_(callbackId, texte) {
+  telegramApi_("answerCallbackQuery", { callback_query_id: callbackId, text: texte });
+}
+
+/**
+ * V5 (P1) — Traitement de l'appui sur « ✅ Pris en charge » :
+ *  - seuls les chats autorisés (ou leurs membres) peuvent accuser ;
+ *  - idempotent : un second appui répond « déjà pris en charge », sans
+ *    double écriture ni double ligne au Journal ;
+ *  - remplit « Pris en charge le » / « Accusé par », fait passer le statut
+ *    de « En attente » à « Pris en charge » (le marqueur CRITIQUE est
+ *    conservé), consigne l'accusé au Journal et met à jour TOUTES les
+ *    copies du message d'alerte (bouton retiré, accusé affiché).
+ */
+function traiterAccuseTelegram_(cq) {
+  try {
+    const data = String(cq.data || "");
+    if (data.indexOf("ack:") !== 0) { repondreCallback_(cq.id, "Action inconnue."); return; }
+    const numero = data.substring(4).trim();
+    const message = cq.message || {};
+    const chatIdMsg = String((message.chat || {}).id || "");
+    const from = cq.from || {};
+    const fromId = String(from.id || "");
+    if (telegramChats_().indexOf(chatIdMsg) === -1 && telegramChats_().indexOf(fromId) === -1) {
+      repondreCallback_(cq.id, "⛔ Non autorisé."); return;
+    }
+    appliquerConfigFeuille_();
+    const sheet = feuilleSuivi_();
+    if (!sheet) { repondreCallback_(cq.id, "Registre inaccessible."); return; }
+    const c = nom => colIndex_(sheet, nom);
+    const donnees = sheet.getDataRange().getValues();
+    let ligne = -1;
+    for (let i = 1; i < donnees.length; i++) {
+      if (String(donnees[i][c("Numéro") - 1]).trim() === numero) { ligne = i + 1; break; }
+    }
+    if (ligne === -1) { repondreCallback_(cq.id, "Signalement introuvable : " + numero); return; }
+    const dejaAccuse = donnees[ligne - 1][c("Pris en charge le") - 1];
+    if (dejaAccuse) {
+      repondreCallback_(cq.id, "Déjà pris en charge par " +
+        (donnees[ligne - 1][c("Accusé par") - 1] || "—") + " le " +
+        Utilities.formatDate(new Date(dejaAccuse), CONFIG.TZ, "dd/MM HH:mm"));
+      return;
+    }
+    const nom = (((from.first_name || "") + " " + (from.last_name || "")).trim()) || from.username || fromId;
+    const maintenant = new Date();
+    sheet.getRange(ligne, c("Pris en charge le")).setValue(maintenant);
+    sheet.getRange(ligne, c("Accusé par")).setValue(nom);
+    const statut = String(donnees[ligne - 1][c("Statut") - 1] || "");
+    if (statut.indexOf("En attente") > -1)
+      sheet.getRange(ligne, c("Statut")).setValue(statut.replace("En attente", "Pris en charge"));
+    journaliser_(numero, nom, "accusé", "Telegram — bouton « Pris en charge »");
+    repondreCallback_(cq.id, "✅ Pris en charge : " + numero);
+    // Mise à jour de toutes les copies du message d'alerte
+    const mention = "\n\n✅ <b>Pris en charge</b> par " + echapperHtml_(nom) + " — " +
+      Utilities.formatDate(maintenant, CONFIG.TZ, "dd/MM/yyyy HH:mm");
+    const baseTexte = message.text ? echapperHtml_(message.text) : "";
+    const refs = String(donnees[ligne - 1][c("Msg Telegram") - 1] || "").split(";").filter(String);
+    const cleOrigine = chatIdMsg + ":" + (message.message_id || "");
+    if (refs.indexOf(cleOrigine) === -1 && message.message_id) refs.push(cleOrigine);
+    refs.forEach(ref => {
+      const parts = ref.split(":");
+      if (parts.length !== 2) return;
+      telegramApi_("editMessageText", {
+        chat_id: parts[0], message_id: parts[1],
+        text: (baseTexte || echapperHtml_("Alerte " + numero)) + mention,
+        parse_mode: "HTML", disable_web_page_preview: "true",
+        reply_markup: JSON.stringify({ inline_keyboard: [] })
+      });
+    });
+  } catch (err) { console.log("❌ traiterAccuseTelegram_ : " + err.message); }
 }
 
 function repondreBot_(chatId, texte) {
@@ -574,6 +890,7 @@ function texteStats_() {
   let total = 0, ouverts = 0, critiquesOuverts = 0;
   for (let i = 1; i < donnees.length; i++) {
     if (!donnees[i][c("Numéro") - 1]) continue;
+    if (estDemo_(String(donnees[i][c("Numéro") - 1]))) continue; // V5 : démos hors statistiques
     total++;
     if (!donnees[i][c("Date clôture") - 1]) {
       ouverts++;
@@ -591,7 +908,7 @@ function texteCritiques_() {
   let n = 0;
   for (let i = 1; i < donnees.length; i++) {
     const g = parseInt(donnees[i][c("Gravité") - 1], 10) || 0;
-    if (g >= CONFIG.SEUIL_CRITIQUE && !donnees[i][c("Date clôture") - 1] && donnees[i][c("Numéro") - 1]) {
+    if (g >= CONFIG.SEUIL_CRITIQUE && !donnees[i][c("Date clôture") - 1] && donnees[i][c("Numéro") - 1] && !estDemo_(String(donnees[i][c("Numéro") - 1]))) {
       lignes.push("• " + donnees[i][c("Numéro") - 1] + " — " + donnees[i][c("Polyclinique") - 1] +
         " / " + donnees[i][c("Service") - 1] + " (gravité " + g + ")");
       n++;
@@ -604,7 +921,7 @@ function texteCritiques_() {
 // 12. DIAGNOSTIC & TESTS (exécution manuelle)
 // ---------------------------------------------------------------------
 function verifierSante() {
-  console.log("--- SANTÉ DU SYSTÈME UPCI V3 ---");
+  console.log("--- SANTÉ DU SYSTÈME UPCI V5 ---");
   const token = telegramToken_();
   console.log("Jeton Telegram : " + (token ? "présent (propriétés)" : "ABSENT — exécutez configurer()"));
   if (token) {
@@ -620,14 +937,14 @@ function verifierSante() {
 }
 
 function testerConfiguration() {
-  console.log("--- TEST V3 ---");
-  envoyerNotifications("Test UPCI V3.0", "Test technique du système (aucune action requise).");
+  console.log("--- TEST V5 ---");
+  envoyerNotifications("Test UPCI V5.0", "Test technique du système (aucune action requise).");
   console.log(texteStats_());
   console.log("--- FIN DU TEST ---");
 }
 
 // ---------------------------------------------------------------------
-// 13. RECONSTRUCTION AUTOMATIQUE DU SYSTÈME (compte 23abdelhadi@gmail.com)
+// 13. RECONSTRUCTION AUTOMATIQUE DU SYSTÈME (compte institutionnel)
 //     setupNouveauSysteme() crée, en une seule exécution :
 //       - le formulaire SIGNALEMENT (structure identique à l'original),
 //       - le classeur REGISTRE (destination des deux formulaires),
@@ -679,7 +996,12 @@ const STRUCTURE_CLOTURE = [
   { title: "Statut de clôture", type: "MC", required: true,
     choices: ["Clôturé", "Partiellement clôturé", "En cours de traitement", "Non résolu — escalade"] },
   { title: "Délai réel d'intervention", type: "MC", required: true,
-    choices: ["Moins d'1 heure", "1 à 4 heures", "4 à 24 heures", "Plus de 24 heures"] }
+    choices: ["Moins d'1 heure", "1 à 4 heures", "4 à 24 heures", "Plus de 24 heures"] },
+  // V5 — boucle d'apprentissage : optionnels, attendus pour les cas critiques.
+  { title: "Action corrective (cas critiques)", type: "PARAGRAPH", required: false,
+    help: "Ce qui a été changé pour éviter la répétition (procédure, stock, équipement…)." },
+  { title: "Vérification d'efficacité (cas critiques)", type: "PARAGRAPH", required: false,
+    help: "À remplir PLUS TARD, lors d'une nouvelle soumission de ce formulaire avec le même numéro : le problème a-t-il réellement disparu ?" }
 ];
 
 const DESC_SIGNALEMENT = "Signalement rapide d'une situation urgente liée à la prévention et au contrôle des infections au sein de l'EPSP de Saïda. 15 secondes. Aucune saisie libre : choisissez uniquement. Conformément à la note n°14 du 25 mai 2026 et à la note de rappel n°93 du 19 octobre 2026.";
@@ -834,4 +1156,347 @@ function doGet(e) {
     "<p style='color:#666;font-size:13px'>Aucune donnée personnelle n'est affichée sur cette page.</p>" +
     "</body></html>";
   return HtmlService.createHtmlOutput(html).setTitle("Suivi UPCI");
+}
+
+// =====================================================================
+// V5-A. JOURNAL D'AUDIT — feuille « Journal » (AJOUT SEUL / append-only)
+// Chaque changement d'état y est consigné : création, accusé, relance,
+// escalade, clôture, vérification, réouverture, regroupement, silence,
+// santé, bulletin, démo. Aucune fonction ne modifie ni ne supprime une
+// ligne du Journal : c'est la piste d'audit du système.
+// =====================================================================
+const ENTETES_JOURNAL = ["Horodatage", "Numéro", "Acteur", "Action", "Détail"];
+
+function feuilleJournal_() {
+  const ss = classeurRegistre_();
+  if (!ss) return null;
+  let sheet = ss.getSheetByName("Journal");
+  if (!sheet) {
+    sheet = ss.insertSheet("Journal");
+    sheet.appendRow(ENTETES_JOURNAL);
+    sheet.getRange(1, 1, 1, ENTETES_JOURNAL.length).setFontWeight("bold").setBackground("#fce5cd");
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function journaliser_(numero, acteur, action, detail) {
+  if (!CONFIG.JOURNAL_ACTIF) return;
+  try {
+    const sheet = feuilleJournal_(); if (!sheet) return;
+    sheet.appendRow([new Date(), String(numero || ""), String(acteur || ""),
+      String(action || ""), String(detail || "").substring(0, 500)]);
+  } catch (e) { console.log("⚠️ Journal : " + e.message); } // ne jamais bloquer le flux principal
+}
+
+// =====================================================================
+// V5-B. OUTILS PDF — bilan CLIN (DocumentApp → PDF) + envoi avec pièce jointe
+// =====================================================================
+function dossierDrive_(nom) {
+  const it = DriveApp.getFoldersByName(nom);
+  return it.hasNext() ? it.next() : DriveApp.createFolder(nom);
+}
+
+/**
+ * Crée le PDF du bilan à partir des lignes texte du rapport mensuel,
+ * l'archive dans le dossier « Rapports UPCI » et renvoie le fichier PDF.
+ * Le document Google Docs intermédiaire est mis à la corbeille : seul
+ * le PDF est conservé.
+ */
+function genererPdfBilan_(lignes) {
+  const titre = lignes[0] || "Bilan mensuel PCI";
+  const doc = DocumentApp.create(titre);
+  const body = doc.getBody();
+  body.appendParagraph(titre).setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  for (let i = 1; i < lignes.length; i++) body.appendParagraph(lignes[i]);
+  body.appendParagraph("").appendParagraph(
+    "Document généré automatiquement par le système d'alerte UPCI — " +
+    Utilities.formatDate(new Date(), CONFIG.TZ, "dd/MM/yyyy HH:mm"));
+  doc.saveAndClose();
+  const fichierDoc = DriveApp.getFileById(doc.getId());
+  const blob = fichierDoc.getAs(MimeType.PDF).setName(titre.replace(/[^\wÀ-ÿ ()-]/g, "") + ".pdf");
+  const pdf = dossierDrive_(CONFIG.DOSSIER_RAPPORTS).createFile(blob);
+  fichierDoc.setTrashed(true);
+  console.log("✅ PDF du bilan archivé : " + pdf.getName());
+  return pdf;
+}
+
+function envoyerMailAvecPdf_(dest, obj, corps, fichierPdf) {
+  try {
+    MailApp.sendEmail({ to: dest, subject: obj, body: corps, attachments: [fichierPdf.getBlob()] });
+    console.log("✅ Email + PDF → " + dest);
+  } catch (e) {
+    console.log("❌ Email + PDF (" + dest + ") : " + e.message);
+    envoyerMail(dest, obj, corps); // repli : texte seul
+  }
+}
+
+// =====================================================================
+// V5-C. RÉOUVERTURE MANUELLE (exécution depuis l'éditeur, par l'admin)
+// Réouvre un dossier clôturé : efface date/durée de clôture, repasse le
+// statut à « Rouvert — En attente », notifie et consigne au Journal.
+// =====================================================================
+function rouvrirSignalement(numero) {
+  appliquerConfigFeuille_();
+  const sheet = feuilleSuivi_();
+  if (!sheet || !numero) { console.log("⚠️ rouvrirSignalement : registre ou numéro manquant."); return; }
+  const c = nom => colIndex_(sheet, nom);
+  const donnees = sheet.getDataRange().getValues();
+  for (let i = 1; i < donnees.length; i++) {
+    if (String(donnees[i][c("Numéro") - 1]).trim() === String(numero).trim()) {
+      if (!donnees[i][c("Date clôture") - 1]) { console.log("ℹ️ " + numero + " n'est pas clôturé — rien à rouvrir."); return; }
+      sheet.getRange(i + 1, c("Date clôture")).setValue("");
+      sheet.getRange(i + 1, c("Durée (h)")).setValue("");
+      sheet.getRange(i + 1, c("Statut")).setValue("Rouvert — En attente");
+      journaliser_(numero, "Administrateur (manuel)", "réouverture", "Réouverture manuelle depuis l'éditeur");
+      envoyerNotifications("↩️ RÉOUVERTURE — " + numero,
+        "Le dossier " + numero + " (" + donnees[i][c("Polyclinique") - 1] + " — " +
+        donnees[i][c("Service") - 1] + ") a été rouvert et repasse en attente de traitement.");
+      console.log("✅ " + numero + " rouvert.");
+      return;
+    }
+  }
+  console.log("⚠️ rouvrirSignalement : numéro introuvable — " + numero);
+}
+
+// =====================================================================
+// V5-D. MODE DÉMO — données de formation / présentation
+// genererDonneesDemo() : crée des signalements marqués « DÉMO » dans le
+// registre, SANS aucune notification (ni email, ni Telegram) et SANS
+// consommmer la numérotation officielle. Les lignes DÉMO sont exclues
+// des indicateurs, des escalades, des regroupements et du silence.
+// supprimerDonneesDemo() : supprime exactement ces lignes, rien d'autre.
+// =====================================================================
+function genererDonneesDemo() {
+  appliquerConfigFeuille_();
+  const sheet = feuilleSuivi_(); if (!sheet) { console.log("⚠️ Registre introuvable."); return; }
+  const c = nom => colIndex_(sheet, nom);
+  const annee = Utilities.formatDate(new Date(), CONFIG.TZ, "yyyy");
+  let seq = 0;
+  sheet.getDataRange().getValues().forEach(r => {
+    const m = String(r[c("Numéro") - 1] || "").match(/^DÉMO-\d{4}-(\d+)$/);
+    if (m) seq = Math.max(seq, parseInt(m[1], 10) || 0);
+  });
+  const maintenant = Date.now();
+  const specs = [
+    { decH: 12 * 24, poly: "Polyclinique Salam 2", service: "Laboratoire", gravite: 2, mesures: "Désinfection de la zone", ferme: true, duree: 3, intervention: "DÉMO — Remplacement du distributeur de savon et réassort du stock." },
+    { decH: 6 * 24, poly: "Polyclinique Rebahia", service: "Salle de soins", gravite: 4, mesures: "Correction du tri", ferme: true, duree: 5, intervention: "DÉMO — Collecte et remplacement du conteneur DASRI.", action: "DÉMO — Un conteneur DASRI de réserve est installé dans chaque salle de soins.", verif: "DÉMO — Contrôle à J+7 : tri conforme, aucun débordement constaté." },
+    { decH: 5 * 24, poly: "Polyclinique 1000 logements", service: "Pharmacie", gravite: 3, mesures: "Information du responsable", ferme: true, duree: 8, intervention: "DÉMO — Réassort des gants et affichage du seuil d'alerte de stock." },
+    { decH: 2 * 24, poly: "Polyclinique Nord (Lamarine)", service: "Accueil", gravite: 5, mesures: "Isolement du patient", ferme: true, duree: 2, intervention: "DÉMO — Désinfection complète de la zone d'accueil.", action: "DÉMO — Solution hydro-alcoolique ajoutée au comptoir d'accueil." },
+    { decH: 4, poly: "Polyclinique Nasr", service: "Maternité", gravite: 4, mesures: "Changement d'équipement", ferme: false, statut: "CRITIQUE - En attente" },
+    { decH: 26, poly: "Polyclinique Sidi Gacem", service: "Radiologie", gravite: 2, mesures: "Désinfection de la zone", ferme: false, statut: "En attente" },
+    { decH: 8 * 24, poly: "Polyclinique Sidi Chikh", service: "Salle de soins", gravite: 3, mesures: "Correction du tri", ferme: true, duree: 26, intervention: "DÉMO — Briefing de l'équipe sur le tri des déchets." },
+    { decH: 10 * 24, poly: "Polyclinique Amrous", service: "Bureau du médecin", gravite: 1, mesures: "Information du responsable", ferme: true, duree: 1, intervention: "DÉMO — Réaffichage de la procédure d'hygiène des mains." }
+  ];
+  specs.forEach(s => {
+    seq++;
+    const numero = "DÉMO-" + annee + "-" + ("000" + seq).slice(-3);
+    const dateSignal = new Date(maintenant - s.decH * 3600000);
+    const ligne = [];
+    ligne[c("Date") - 1] = dateSignal;
+    ligne[c("Numéro") - 1] = numero;
+    ligne[c("Type") - 1] = "DÉMO";
+    ligne[c("Polyclinique") - 1] = s.poly;
+    ligne[c("Service") - 1] = s.service;
+    ligne[c("Gravité") - 1] = s.gravite;
+    ligne[c("Délai demandé") - 1] = "DÉMO";
+    ligne[c("Mesures") - 1] = s.mesures;
+    if (s.ferme) {
+      ligne[c("Statut") - 1] = "Clôturé";
+      ligne[c("Intervention") - 1] = s.intervention || "";
+      ligne[c("Délai réel") - 1] = "DÉMO";
+      ligne[c("Date clôture") - 1] = new Date(dateSignal.getTime() + (s.duree || 1) * 3600000);
+      ligne[c("Durée (h)") - 1] = s.duree || 1;
+      ligne[c("Action corrective") - 1] = s.action || "";
+      ligne[c("Vérification d'efficacité") - 1] = s.verif || "";
+    } else {
+      ligne[c("Statut") - 1] = s.statut || "En attente";
+    }
+    sheet.appendRow(ligne.map(v => v === undefined ? "" : v));
+    journaliser_(numero, "Mode démo", "création", "Données de démonstration (formation / présentation)");
+  });
+  console.log("✅ Mode démo : " + specs.length + " signalements DÉMO créés (aucune notification envoyée). " +
+    "Pour les retirer : supprimerDonneesDemo().");
+}
+
+function supprimerDonneesDemo() {
+  const sheet = feuilleSuivi_(); if (!sheet) { console.log("⚠️ Registre introuvable."); return; }
+  const cNum = colIndex_(sheet, "Numéro");
+  const donnees = sheet.getDataRange().getValues();
+  let supprimes = 0;
+  for (let i = donnees.length - 1; i >= 1; i--) { // de bas en haut : indices stables
+    if (estDemo_(String(donnees[i][cNum - 1] || ""))) { sheet.deleteRow(i + 1); supprimes++; }
+  }
+  journaliser_("-", "Mode démo", "suppression démo", supprimes + " ligne(s) DÉMO supprimée(s)");
+  console.log("✅ Mode démo : " + supprimes + " ligne(s) DÉMO supprimée(s). Aucune autre ligne touchée.");
+}
+
+// =====================================================================
+// V5-E. MONITEUR DE SILENCE (P8) — contrôle hebdomadaire des sites muets
+// Un site sans AUCUN signalement depuis SILENCE_SEMAINES semaines est
+// signalé à l'administrateur : le silence est une donnée (sous-détection
+// probable), pas un succès. Sites : clé SITES de la feuille
+// « Configuration », sinon valeurs distinctes du registre.
+// Exemptions possibles : clé SITES_EXEMPTS (fermeture, travaux…).
+// =====================================================================
+function controleSilenceSites() {
+  appliquerConfigFeuille_();
+  if (!CONFIG.SILENCE_ACTIF) return;
+  const sheet = feuilleSuivi_(); if (!sheet) return;
+  const c = nom => colIndex_(sheet, nom);
+  const donnees = sheet.getDataRange().getValues();
+  const limite = new Date(Date.now() - CONFIG.SILENCE_SEMAINES * 7 * 86400000);
+  const vus = {}, actifs = {};
+  for (let i = 1; i < donnees.length; i++) {
+    const poly = String(donnees[i][c("Polyclinique") - 1] || "").trim();
+    if (!poly) continue;
+    vus[poly] = true;
+    if (estDemo_(String(donnees[i][c("Numéro") - 1] || ""))) continue; // les démos ne « réveillent » pas un site
+    const d = new Date(donnees[i][c("Date") - 1]);
+    if (!isNaN(d) && d >= limite) actifs[poly] = true;
+  }
+  const sites = (SITES_ && SITES_.length) ? SITES_.slice() : Object.keys(vus);
+  const exempts = (SITES_EXEMPTS_ || []).map(normaliser_);
+  const silencieux = sites.filter(s => !actifs[s] && exempts.indexOf(normaliser_(s)) === -1);
+  if (!sites.length) { console.log("ℹ️ Silence : aucun site connu (registre vide et clé SITES absente)."); return; }
+  if (!silencieux.length) { console.log("✅ Silence : tous les sites ont signalé dans les " + CONFIG.SILENCE_SEMAINES + " dernières semaines."); return; }
+  const sujet = "🔕 Sites silencieux — aucun signalement depuis " + CONFIG.SILENCE_SEMAINES + " semaines";
+  const corps = [sujet + " :",
+    silencieux.map(s => "• " + s).join("\n"),
+    "",
+    "Un site qui ne signale rien n'est pas un site sans problèmes : sous-détection probable.",
+    "Action suggérée : visite d'appui bienveillante et vérification de l'affichage du QR code — pas de sanction."
+  ].join("\n");
+  envoyerMail(CONFIG.ADMIN_EMAIL, sujet, corps);
+  envoyerTelegram("<b>" + echapperHtml_(sujet) + "</b>\n\n" + echapperHtml_(corps));
+  journaliser_("-", "Système", "silence", silencieux.length + " site(s) silencieux : " + silencieux.join(", "));
+  console.log(corps);
+}
+
+// =====================================================================
+// V5-F. BULLETIN MENSUEL (P7) — « Vous avez signalé → nous avons changé »
+// Construit des clôtures du mois écoulé : volumes par site, dossiers
+// résolus, délai moyen de clôture et changements concrets (actions
+// correctives). Aucune donnée sensible (aucun email de déclarant).
+// Destinataires : clé EMAILS_BULLETIN, sinon destinataires d'alerte.
+// =====================================================================
+function bulletinMensuel() {
+  appliquerConfigFeuille_();
+  if (!CONFIG.BULLETIN_ACTIF) return;
+  const sheet = feuilleSuivi_(); if (!sheet) return;
+  const ref = new Date(); ref.setDate(0); // dernier jour du mois écoulé
+  const mois = ref.getMonth(), annee = ref.getFullYear();
+  const c = nom => colIndex_(sheet, nom);
+  const donnees = sheet.getDataRange().getValues();
+  let total = 0, sommeDurees = 0, nbDurees = 0;
+  const parSite = {}, resolus = [], changements = [];
+  for (let i = 1; i < donnees.length; i++) {
+    const numero = String(donnees[i][c("Numéro") - 1] || "");
+    if (!numero || estDemo_(numero)) continue;
+    const d = new Date(donnees[i][c("Date") - 1]);
+    const poly = String(donnees[i][c("Polyclinique") - 1] || "—");
+    if (!isNaN(d) && d.getMonth() === mois && d.getFullYear() === annee) {
+      total++;
+      parSite[poly] = (parSite[poly] || 0) + 1;
+    }
+    const dClot = donnees[i][c("Date clôture") - 1] ? new Date(donnees[i][c("Date clôture") - 1]) : null;
+    if (dClot && !isNaN(dClot) && dClot.getMonth() === mois && dClot.getFullYear() === annee) {
+      resolus.push("• " + numero + " — " + poly + " : " + String(donnees[i][c("Intervention") - 1] || "traité"));
+      const duree = parseFloat(donnees[i][c("Durée (h)") - 1]);
+      if (!isNaN(duree)) { sommeDurees += duree; nbDurees++; }
+      const action = String(donnees[i][c("Action corrective") - 1] || "").trim();
+      if (action) changements.push("• " + numero + " (" + poly + ") : " + action);
+    }
+  }
+  if (!total && !resolus.length) {
+    console.log("ℹ️ Bulletin : aucune activité le mois écoulé — envoi annulé.");
+    journaliser_("-", "Système", "bulletin", "Aucune activité (" + (mois + 1) + "/" + annee + ") — envoi annulé");
+    return;
+  }
+  const lignes = [
+    "VOUS AVEZ SIGNALÉ → NOUS AVONS CHANGÉ",
+    "Bulletin PCI — EPSP Saïda (" + (mois + 1) + "/" + annee + ")",
+    "",
+    "📣 Vous avez signalé : " + total + " signalement(s) ce mois-ci" +
+      (Object.keys(parSite).length ? " (" + Object.keys(parSite).sort().map(p => p + " : " + parSite[p]).join(" ; ") + ")" : "") + ".",
+    "✅ Nous avons traité : " + resolus.length + " dossier(s) clôturé(s)" +
+      (nbDurees ? " — délai moyen de clôture : " + (Math.round(sommeDurees / nbDurees * 10) / 10) + " h." : "."),
+    "",
+    "🔧 Ce qui a concrètement changé grâce à vos signalements :"
+  ];
+  if (changements.length) changements.slice(0, 10).forEach(x => lignes.push(x));
+  else lignes.push("• (Les actions correctives des cas critiques apparaîtront ici dès leur consignation.)");
+  lignes.push("", "📌 Exemples de dossiers résolus :");
+  if (resolus.length) resolus.slice(0, 10).forEach(x => lignes.push(x));
+  else lignes.push("• Aucun dossier clôturé ce mois-ci — les dossiers ouverts restent suivis.");
+  lignes.push("", "Merci pour votre vigilance. Continuez : le QR code affiché dans votre service est votre outil — chaque signalement compte.");
+  const corps = lignes.join("\n");
+  const dests = emailsBulletin_();
+  dests.forEach(em => envoyerMail(em, "📬 Vous avez signalé → nous avons changé — " + (mois + 1) + "/" + annee, corps));
+  journaliser_("-", "Système", "bulletin", "Bulletin " + (mois + 1) + "/" + annee + " envoyé à " + dests.length + " destinataire(s)");
+  console.log(corps);
+}
+
+// =====================================================================
+// V5-G. BATTEMENT DE CŒUR (P14) — contrôle de santé hebdomadaire
+// Vérifie : déclencheurs attendus présents, registre joignable, date du
+// dernier signalement, sauvegarde récente présente. Envoie UNE ligne
+// OK/alerte à l'administrateur (email + Telegram) et consigne au Journal.
+// Le silence du système devient ainsi visible avant qu'il ne nuise.
+// =====================================================================
+function controleSanteHebdomadaire() {
+  appliquerConfigFeuille_();
+  if (!CONFIG.SANTE_ACTIF) return;
+  const problemes = [];
+  // 1) Déclencheurs attendus
+  const attendus = ["onFormSubmit", "verifierCritiquesEnAttente", "rapportMensuel",
+    "sauvegardeHebdomadaire", "controleSilenceSites", "bulletinMensuel", "controleSanteHebdomadaire"];
+  const presents = ScriptApp.getProjectTriggers().map(t => t.getHandlerFunction());
+  const manquants = attendus.filter(h => presents.indexOf(h) === -1);
+  if (manquants.length) problemes.push("déclencheur(s) manquant(s) : " + manquants.join(", ") + " — relancez installerTriggers()");
+  // 2) Registre joignable + dernier signalement
+  let dernierTxt = "aucun";
+  try {
+    const sheet = feuilleSuivi_();
+    if (!sheet) problemes.push("registre inaccessible");
+    else {
+      const cDate = colIndex_(sheet, "Date"), cNum = colIndex_(sheet, "Numéro");
+      const donnees = sheet.getDataRange().getValues();
+      let dernier = null;
+      for (let i = 1; i < donnees.length; i++) {
+        if (estDemo_(String(donnees[i][cNum - 1] || ""))) continue;
+        const d = new Date(donnees[i][cDate - 1]);
+        if (!isNaN(d) && (!dernier || d > dernier)) dernier = d;
+      }
+      if (dernier) dernierTxt = Utilities.formatDate(dernier, CONFIG.TZ, "dd/MM/yyyy");
+    }
+  } catch (e) { problemes.push("registre inaccessible : " + e.message); }
+  // 3) Sauvegarde récente (≤ 8 jours)
+  let sauvTxt = "absente";
+  try {
+    const it = DriveApp.getFoldersByName(CONFIG.DOSSIER_SAUVEGARDE);
+    if (!it.hasNext()) problemes.push("dossier « " + CONFIG.DOSSIER_SAUVEGARDE + " » introuvable");
+    else {
+      const fichiers = it.next().getFiles();
+      let recente = null;
+      while (fichiers.hasNext()) {
+        const f = fichiers.next();
+        if (!recente || f.getLastUpdated() > recente) recente = f.getLastUpdated();
+      }
+      if (!recente) problemes.push("aucune sauvegarde dans le dossier");
+      else {
+        sauvTxt = Utilities.formatDate(recente, CONFIG.TZ, "dd/MM/yyyy");
+        if ((Date.now() - recente.getTime()) > 8 * 86400000) problemes.push("sauvegarde ancienne (" + sauvTxt + ")");
+      }
+    }
+  } catch (e) { problemes.push("sauvegarde non vérifiable : " + e.message); }
+  const ok = !problemes.length;
+  const ligne = (ok ? "💓 UPCI — santé OK" : "⚠️ UPCI — santé DÉGRADÉE") +
+    " | déclencheurs " + (attendus.length - manquants.length) + "/" + attendus.length +
+    " | dernier signalement : " + dernierTxt + " | sauvegarde : " + sauvTxt +
+    (ok ? "" : " | problèmes : " + problemes.join(" ; "));
+  envoyerMail(CONFIG.ADMIN_EMAIL, ligne, ligne);
+  envoyerTelegram(echapperHtml_(ligne));
+  journaliser_("-", "Système", "santé", ligne);
+  console.log(ligne);
 }
